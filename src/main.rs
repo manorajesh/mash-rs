@@ -1,7 +1,7 @@
 use std::{path::PathBuf, ffi::CString};
 
 use nix::{unistd::{ForkResult, fork, execvp, chdir}, sys::wait::wait};
-use rustyline::{DefaultEditor, error::ReadlineError, Helper};
+use rustyline::{DefaultEditor, KeyEvent, Cmd};
 
 struct Shell {
     prompt: String,
@@ -12,7 +12,7 @@ struct Shell {
 
 impl Default for Shell {
     fn default() -> Self {
-        let home = std::env::var("HOME").log_expect("Failed to get $HOME");
+        let home = std::env::var("HOME").unwrap_or(String::from("/"));
         Self {
             prompt: format!("{} % ", home),
             path: PathBuf::from(&home),
@@ -23,7 +23,7 @@ impl Default for Shell {
 }
 
 impl Shell {
-    fn execute(&mut self) -> Result<(), &str> {
+    fn execute(&mut self) -> Result<(), String> {
         if let Some(command) = &self.current_command {
             match command.name.as_str() {
                 "cd" => {
@@ -34,12 +34,12 @@ impl Shell {
                         } else {
                             self.path = path;
                         }
-                        self.prompt = format!("{} % ", self.path.to_str().log_expect("Failed to convert path to str"));
+                        self.prompt = format!("{} % ", self.path.to_str().ok_or("Unable to convert path to str")?);
                     } else {
                         self.path = self.home.clone();
                     }
-                    self.prompt = format!("{} % ", self.path.canonicalize().log_expect("").display());
-                    chdir(self.path.as_os_str()).log_expect("Failed to change directory");
+                    self.prompt = format!("{} % ", self.path.canonicalize().map_err(|e| e.to_string())?.display());
+                    chdir(self.path.as_os_str()).map_err(|e| e.to_string())?;
                 },
                 _ => {
                     command.execute_external(&self.path)?;
@@ -70,24 +70,24 @@ impl Command {
         Self::new(name, args)
     }
 
-    fn execute_external(&self, workdir: &PathBuf) -> Result<(), &str> {
+    fn execute_external(&self, workdir: &PathBuf) -> Result<(), String> {
         match unsafe { fork() } {
             Ok(ForkResult::Parent { .. }) => {
                 // parent process
                 // wait for child process to finish
-                wait().log_expect("Failed to wait for child process");
+                wait().map_err(|e| e.to_string())?;
             }
 
             Ok(ForkResult::Child) => {
-                chdir(workdir.as_os_str()).log_expect("Failed to change directory");
-                let cmd = CString::new(self.name.clone()).log_expect("Failed to create CString");
+                chdir(workdir.as_os_str()).map_err(|e| e.to_string())?;
+                let cmd = CString::new(self.name.clone()).map_err(|e| e.to_string())?;
                 let mut args = self.args.iter().map(|arg| CString::new(arg.clone()).log_expect("Failed to create CString for args")).collect::<Vec<_>>();
                 args.insert(0, cmd.clone());
-                execvp(&cmd, &args).log_expect("");
+                execvp(&cmd, &args).map_err(|e| e.to_string())?;
             }
 
             Err(_) => {
-                return Err("Failed to fork process")
+                return Err(String::from("Failed to fork process"));
             }
         }
         Ok(())
@@ -108,6 +108,9 @@ fn main() -> Result<(), ()> {
         std::fs::File::create(".mash_history").log_expect("Failed to create history file");
     }
     let mut shell = Shell::default();
+    rl.bind_sequence(KeyEvent::ctrl('r'), Cmd::HistorySearchBackward);
+    // tab completion
+    rl.bind_sequence(KeyEvent::ctrl('i'), Cmd::Complete);
 
     loop {
         let readline = rl.readline(shell.prompt.as_str());
@@ -121,18 +124,20 @@ fn main() -> Result<(), ()> {
                     break;
                 }
 
-                rl.add_history_entry(line.as_str()).log_expect("Failed to add history entry");
                 shell.current_command = Some(Command::parse(&line));
 
-                shell.execute().log_expect("");
+                if let Err(e) = shell.execute() {
+                    log::error!("{}", e);
+                } else {
+                    rl.add_history_entry(line.as_str()).log_expect("Failed to add history entry");
+                    rl.save_history(".mash_history").log_expect("Failed to save history file");
+                }
             },
             Err(e) => {
                 log::error!("{}", e);
             }
         }
     }
-
-    rl.save_history(".mash_history").log_expect("Failed to save history file");
     Ok(())
 }
 
